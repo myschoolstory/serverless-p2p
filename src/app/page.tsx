@@ -1,103 +1,322 @@
-import Image from "next/image";
+'use client';
+
+import { useCallback, useMemo, useRef, useState } from 'react';
+import { SignalingClient, type Signal } from '@/lib/signaling';
+
+type TransferState =
+  | { status: 'idle' }
+  | { status: 'connecting' }
+  | { status: 'connected' }
+  | { status: 'transferring'; sentBytes: number; totalBytes: number }
+  | { status: 'receiving'; receivedBytes: number; totalBytes?: number }
+  | { status: 'done' }
+  | { status: 'error'; message: string };
 
 export default function Home() {
-  return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+  const [room, setRoom] = useState<string>('');
+  const [joined, setJoined] = useState(false);
+  const [role, setRole] = useState<'offerer' | 'answerer' | null>(null);
+  const [state, setState] = useState<TransferState>({ status: 'idle' });
+  const [log, setLog] = useState<string[]>([]);
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const sigRef = useRef<SignalingClient | null>(null);
+
+  const pendingCandidates = useRef<any[]>([]);
+  const addLog = useCallback((l: string) => setLog((prev) => [l, ...prev].slice(0, 200)), []);
+
+  const createPC = useCallback(() => {
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+    });
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        sigRef.current?.send({ type: 'candidate', candidate: e.candidate.toJSON() });
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      addLog(`pc state: ${pc.connectionState}`);
+      if (pc.connectionState === 'connected') setState({ status: 'connected' });
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        setState({ status: 'error', message: 'Peer connection lost' });
+      }
+    };
+    pc.ondatachannel = (ev) => {
+      addLog('datachannel received');
+      setupDataChannel(ev.channel);
+    };
+    pcRef.current = pc;
+    return pc;
+  }, [addLog]);
+
+  const setupDataChannel = (dc: RTCDataChannel) => {
+    dc.binaryType = 'arraybuffer';
+    dc.bufferedAmountLowThreshold = 1 << 20; // 1MB
+    dc.onopen = () => {
+      addLog('datachannel open');
+    };
+    dc.onmessage = (ev) => {
+      const data = ev.data as ArrayBuffer | string;
+      if (typeof data === 'string') {
+        try {
+          const meta = JSON.parse(data);
+          if (meta.type === 'file-meta') {
+            const total = meta.size as number;
+            setState({ status: 'receiving', receivedBytes: 0, totalBytes: total });
+            incoming.current = { name: meta.name, type: meta.mime, size: total, chunks: [] };
+          }
+        } catch {
+          // ignore misc text
+        }
+      } else {
+        // receiving file chunk
+        if (incoming.current) {
+          incoming.current.chunks.push(new Uint8Array(data));
+          const rec = incoming.current.chunks.reduce((a, b) => a + b.byteLength, 0);
+          setState({ status: 'receiving', receivedBytes: rec, totalBytes: incoming.current.size });
+          if (rec >= incoming.current.size) {
+            // assemble
+            const blob = new Blob(incoming.current.chunks, { type: incoming.current.type || 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = incoming.current.name || 'download';
+            a.click();
+            URL.revokeObjectURL(url);
+            setState({ status: 'done' });
+            addLog('file received');
+            incoming.current = null;
+          }
+        }
+      }
+    };
+    dc.onclose = () => addLog('datachannel closed');
+    dcRef.current = dc;
+  };
+
+  const incoming = useRef<{
+    name?: string;
+    type?: string;
+    size: number;
+    chunks: Uint8Array[];
+  } | null>(null);
+
+  const join = useCallback(async () => {
+    if (!room) {
+      alert('Enter a room id');
+      return;
+    }
+    setJoined(true);
+    setState({ status: 'connecting' });
+    const sig = new SignalingClient(room, async (msg: Signal) => {
+      if (msg.type === 'role') {
+        setRole(msg.role);
+        addLog(`assigned role: ${msg.role}`);
+        const pc = createPC();
+        if (msg.role === 'offerer') {
+          const dc = pc.createDataChannel('file');
+          setupDataChannel(dc);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sig.send({ type: 'offer', sdp: offer });
+        }
+      } else if (msg.type === 'peer-join') {
+        addLog('peer joined');
+      } else if (msg.type === 'offer') {
+        const pc = pcRef.current ?? createPC();
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sig.send({ type: 'answer', sdp: answer });
+        // flush queued candidates
+        for (const c of pendingCandidates.current) {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+        }
+        pendingCandidates.current = [];
+      } else if (msg.type === 'answer') {
+        const pc = pcRef.current;
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          // flush queued candidates
+          for (const c of pendingCandidates.current) {
+            await pc.addIceCandidate(new RTCIceCandidate(c));
+          }
+          pendingCandidates.current = [];
+        }
+      } else if (msg.type === 'candidate') {
+        const pc = pcRef.current;
+        if (pc) {
+          if (pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+          } else {
+            pendingCandidates.current.push(msg.candidate);
+          }
+        } else {
+          pendingCandidates.current.push(msg.candidate);
+        }
+      } else if (msg.type === 'peer-leave') {
+        addLog('peer left');
+      }
+    });
+    sigRef.current = sig;
+    try {
+      await sig.connect();
+      addLog('connected to signaling');
+    } catch (e: any) {
+      addLog('signaling failed');
+      setState({ status: 'error', message: e?.message ?? 'signaling error' });
+    }
+  }, [room, createPC, addLog]);
+
+  const leave = useCallback(() => {
+    sigRef.current?.close();
+    pcRef.current?.close();
+    dcRef.current?.close();
+    setJoined(false);
+    setRole(null);
+    setState({ status: 'idle' });
+    addLog('left room');
+  }, [addLog]);
+
+  const onPickFile = useCallback(async (file: File) => {
+    const dc = dcRef.current;
+    if (!dc || dc.readyState !== 'open') {
+      alert('Peer not connected yet');
+      return;
+    }
+
+    // send metadata first
+    dc.send(JSON.stringify({ type: 'file-meta', name: file.name, size: file.size, mime: file.type }));
+    const chunkSize = 64 * 1024; // 64KB
+    let offset = 0;
+    setState({ status: 'transferring', sentBytes: 0, totalBytes: file.size });
+    while (offset < file.size) {
+      const slice = file.slice(offset, offset + chunkSize);
+      const buf = await slice.arrayBuffer();
+
+      // backpressure: wait if buffer is high
+      if (dc.bufferedAmount > 8 << 20) {
+        await new Promise<void>((resolve) => {
+          const handler = () => {
+            dc.removeEventListener('bufferedamountlow', handler);
+            resolve();
+          };
+          dc.addEventListener('bufferedamountlow', handler, { once: true });
+        });
+      }
+
+      dc.send(buf);
+      offset += chunkSize;
+      setState({ status: 'transferring', sentBytes: Math.min(offset, file.size), totalBytes: file.size });
+      // micro-yield
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    addLog('file sent');
+    setState({ status: 'done' });
+  }, []);
+
+  const statusText = useMemo(() => {
+    switch (state.status) {
+      case 'idle':
+        return 'Idle';
+      case 'connecting':
+        return 'Connecting...';
+      case 'connected':
+        return 'Connected. Ready to transfer.';
+      case 'transferring':
+        return `Sending ${((state.sentBytes / state.totalBytes) * 100).toFixed(1)}%`;
+      case 'receiving':
+        return `Receiving ${state.totalBytes ? ((state.receivedBytes / state.totalBytes) * 100).toFixed(1) : ''}%`;
+      case 'done':
+        return 'Done';
+      case 'error':
+        return `Error: ${state.message}`;
+    }
+  }, [state]);
+
+  const shareUrl = useMemo(() => {
+    if (!room) return '';
+    if (typeof window === 'undefined') return '';
+    const url = new URL(window.location.href);
+    url.searchParams.set('room', room);
+    return url.toString();
+  }, [room]);
+
+  return (
+    <div className="min-h-screen bg-background text-foreground font-sans">
+      <div className="max-w-3xl mx-auto p-6">
+        <h1 className="text-2xl font-semibold mb-2">P2P Share</h1>
+        <p className="text-sm opacity-70 mb-6">
+          Share files peer-to-peer using a temporary signaling room running on Vercel Functions.
+        </p>
+
+        <div className="flex flex-col sm:flex-row gap-3 mb-6">
+          <input
+            className="flex-1 rounded-md border border-black/10 dark:border-white/15 bg-transparent px-3 py-2 outline-none"
+            placeholder="Enter room id (e.g. team-standup)"
+            value={room}
+            onChange={(e) => setRoom(e.target.value)}
+            disabled={joined}
+          />
+          {!joined ? (
+            <button
+              className="rounded-md bg-foreground text-background px-4 py-2 font-medium hover:opacity-90"
+              onClick={join}
+            >
+              Join
+            </button>
+          ) : (
+            <button
+              className="rounded-md border border-black/10 dark:border-white/15 px-4 py-2 font-medium hover:bg-black/[.03] dark:hover:bg-white/[.06]"
+              onClick={leave}
+            >
+              Leave
+            </button>
+          )}
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
+
+        {room && (
+          <div className="mb-4 text-xs">
+            Share this link with your peer after you join:
+            <div className="mt-1 rounded border border-black/10 dark:border-white/15 p-2 font-mono break-all">
+              {shareUrl || '—'}
+            </div>
+          </div>
+        )}
+
+        <div className="mb-6 text-sm">
+          <div>Role: <span className="font-mono">{role ?? '-'}</span></div>
+          <div>Status: <span className="font-mono">{statusText}</span></div>
+        </div>
+
+        <div className="mb-8">
+          <label className="block text-sm mb-2">Send a file</label>
+          <input
+            type="file"
+            disabled={!joined}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onPickFile(f);
+            }}
           />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-sm font-medium">Logs</div>
+          <div className="rounded-md border border-black/10 dark:border-white/15 p-3 text-xs h-48 overflow-auto bg-black/[.02] dark:bg-white/[.03]">
+            {log.length === 0 ? <div className="opacity-60">No logs yet</div> : (
+              <ul className="space-y-1">
+                {log.map((l, i) => (<li key={i} className="font-mono">{l}</li>))}
+              </ul>
+            )}
+          </div>
+        </div>
+
+        <footer className="mt-10 text-xs opacity-70">
+          This app uses WebRTC for data transfer and an ephemeral WebSocket on Vercel Edge for signaling only.
+        </footer>
+      </div>
     </div>
   );
 }
